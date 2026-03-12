@@ -8,6 +8,11 @@ services:
     environment:
       MCP_TRANSPORT: http
       PORT: 9000
+      # PATH_PREFIX must match the path prefix your reverse proxy passes through.
+      # If Nginx proxies /mcp/ → http://localhost:9000/mcp/ (passes prefix), set:
+      #   PATH_PREFIX: /mcp
+      # If Nginx strips the prefix before forwarding, remove this or leave blank.
+      PATH_PREFIX: /mcp
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/health"]
       interval: 30s

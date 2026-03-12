@@ -548,28 +548,57 @@ async function startStdio(): Promise<void> {
 }
 
 async function startHttp(): Promise<void> {
-  // Each SSE connection gets its own Server + SSEServerTransport instance.
-  // The HTTP server routes:
-  //   GET  /sse   → open SSE stream (client connects here)
-  //   POST /message → client sends JSON-RPC messages here
+  // PATH_PREFIX: if your reverse proxy forwards the full path to this server,
+  // set PATH_PREFIX to the prefix so routing matches correctly.
+  // e.g. Nginx proxies https://example.com/mcp/ → http://localhost:9000/mcp/
+  //      → set PATH_PREFIX=/mcp
+  // If Nginx strips the prefix before forwarding, leave PATH_PREFIX unset.
+  const pathPrefix = (process.env.PATH_PREFIX ?? "").replace(/\/$/, "");
+
+  const ssePath     = `${pathPrefix}/sse`;
+  const messagePath = `${pathPrefix}/message`;
+  const healthPath  = `${pathPrefix}/health`;
+
+  // Track live sessions: sessionId → transport
   const transports = new Map<string, SSEServerTransport>();
 
+  // Extract just the pathname from a raw req.url (strips query string)
+  function pathname(url: string | undefined): string {
+    if (!url) return "/";
+    const q = url.indexOf("?");
+    return q === -1 ? url : url.slice(0, q);
+  }
+
+  // mcp-remote appends ?sessionId=<id> to the POST URL rather than using a header
+  function sessionIdFromUrl(url: string | undefined): string | undefined {
+    if (!url) return undefined;
+    const q = url.indexOf("?");
+    if (q === -1) return undefined;
+    return new URLSearchParams(url.slice(q + 1)).get("sessionId") ?? undefined;
+  }
+
   const httpServer = http.createServer(async (req, res) => {
-    // Health-check endpoint
-    if (req.method === "GET" && req.url === "/health") {
+    const path = pathname(req.url);
+
+    // ── Health check ─────────────────────────────────────────────────────────
+    if (req.method === "GET" && path === healthPath) {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", transport: "http+sse" }));
+      res.end(JSON.stringify({ status: "ok", transport: "http+sse", pathPrefix: pathPrefix || "/" }));
       return;
     }
 
-    // SSE endpoint — client opens a persistent EventSource connection here
-    if (req.method === "GET" && req.url === "/sse") {
+    // ── SSE endpoint — client opens a persistent EventSource here ────────────
+    if (req.method === "GET" && path === ssePath) {
       const server = createServer();
-      const transport = new SSEServerTransport("/message", res);
+
+      // The string passed to SSEServerTransport is the URL the client will POST
+      // messages to. It must match the client-visible path (through the proxy).
+      const transport = new SSEServerTransport(messagePath, res);
       transports.set(transport.sessionId, transport);
 
       res.on("close", () => {
         transports.delete(transport.sessionId);
+        console.error(`[SSE] Client disconnected — session ${transport.sessionId}`);
       });
 
       await server.connect(transport);
@@ -577,33 +606,45 @@ async function startHttp(): Promise<void> {
       return;
     }
 
-    // Message endpoint — client POSTs JSON-RPC messages here
-    if (req.method === "POST" && req.url === "/message") {
-      const sessionId = req.headers["x-session-id"] as string | undefined;
+    // ── Message endpoint — client POSTs JSON-RPC here ────────────────────────
+    if (req.method === "POST" && path === messagePath) {
+      // mcp-remote sends sessionId as a query param (?sessionId=...)
+      // Fall back to x-session-id header for other clients
+      const sessionId =
+        sessionIdFromUrl(req.url) ??
+        (req.headers["x-session-id"] as string | undefined);
 
-      if (!sessionId || !transports.has(sessionId)) {
+      if (!sessionId) {
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({ error: "Missing or unknown x-session-id header" })
-        );
+        res.end(JSON.stringify({ error: "Missing sessionId (expected as ?sessionId= query param or x-session-id header)" }));
         return;
       }
 
-      const transport = transports.get(sessionId)!;
+      const transport = transports.get(sessionId);
+      if (!transport) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Unknown session: ${sessionId}` }));
+        return;
+      }
+
       await transport.handlePostMessage(req, res);
       return;
     }
 
-    // 404 for anything else
+    // ── 404 — log it to help diagnose routing issues ──────────────────────────
+    console.error(`[HTTP] 404 ${req.method} ${req.url}`);
     res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not found" }));
+    res.end(JSON.stringify({ error: "Not found", receivedPath: path, expectedPaths: [ssePath, messagePath, healthPath] }));
   });
 
   httpServer.listen(PORT, () => {
     console.error(`ESCAP MCP Server listening on http://0.0.0.0:${PORT}`);
-    console.error(`  SSE endpoint:     http://0.0.0.0:${PORT}/sse`);
-    console.error(`  Message endpoint: http://0.0.0.0:${PORT}/message`);
-    console.error(`  Health check:     http://0.0.0.0:${PORT}/health`);
+    console.error(`  SSE endpoint:     http://0.0.0.0:${PORT}${ssePath}`);
+    console.error(`  Message endpoint: http://0.0.0.0:${PORT}${messagePath}`);
+    console.error(`  Health check:     http://0.0.0.0:${PORT}${healthPath}`);
+    if (pathPrefix) {
+      console.error(`  Path prefix:      ${pathPrefix}  (PATH_PREFIX env var)`);
+    }
   });
 }
 
