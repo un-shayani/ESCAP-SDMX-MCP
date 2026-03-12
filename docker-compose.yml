@@ -1,0 +1,28 @@
+services:
+  escap-mcp:
+    image: escap-mcp:latest        # built locally — see deployment steps in README
+    container_name: escap-mcp
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      MCP_TRANSPORT: http
+      PORT: 9000
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Optional: uncomment to attach to an existing network (e.g. a reverse proxy)
+    # networks:
+    #   - proxy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# networks:
+#   proxy:
+#     external: true

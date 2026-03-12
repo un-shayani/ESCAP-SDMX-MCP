@@ -1,192 +1,209 @@
-# ESCAP SDG MCP Server — MVP
+# ESCAP Data Explorer MCP Server
 
-An MCP (Model Context Protocol) server that wraps the ESCAP SDMX REST API,
-letting any MCP-compatible host (Claude Desktop, Claude Code, etc.) query
-SDG data through natural language.
+An MCP (Model Context Protocol) server that connects AI agents to the [UNESCAP Data Explorer](https://dataexplorer.unescap.org), which exposes statistical data via the **SDMX v2.1 REST API** developed by the European Commission.
 
----
+## Features
 
-## Architecture
+Five tools following the recommended workflow:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  MCP Host (Claude Desktop / Claude Code / any MCP client)   │
-└────────────────────────┬────────────────────────────────────┘
-                         │  MCP Protocol (JSON-RPC over stdio)
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   escap-sdg-mcp-server                      │
-│                                                             │
-│   src/index.ts          — MCP server + tool handlers        │
-│   src/api-client.ts     — SDMX REST API wrapper             │
-└────────────────────────┬────────────────────────────────────┘
-                         │  HTTPS REST (SDMX 2.1 / 3.0)
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│         api-dataexplorer.unescap.org/rest/...               │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Key components
-
-| File | Role |
-|---|---|
-| `src/index.ts` | MCP Server — registers tools, handles requests |
-| `src/api-client.ts` | Thin HTTP client — constructs URLs, parses XML/JSON |
-| `package.json` | ESM Node project, MCP SDK dependency |
-| `tsconfig.json` | TypeScript config targeting ES2022 |
+| Step | Tool | Description |
+|------|------|-------------|
+| 1 | `get_indicators` | Browse the full SDG & Thematic indicator hierarchy |
+| 2 | `get_indicator_metadata` | Fetch structure/dimensions for a chosen indicator |
+| 3 | `get_countries` | List all available countries and reference area codes |
+| 4 | `check_data_availability` | Confirm data exists before fetching |
+| 5 | `get_data` | Retrieve data as SDMX CSV |
 
 ---
 
-## MCP Tools Exposed
+## Requirements
 
-| Tool | Description |
-|---|---|
-| `get_sdg_data` | Fetch indicator time-series observations |
-| `get_dataflow_info` | Get metadata: dimensions, codelists, concepts |
-| `list_dataflows` | List all available datasets for an agency |
-| `build_data_url` | Construct a query URL without fetching |
+- **Node.js** v18 or later (for native `fetch` support)
+- **npm** v8 or later
 
 ---
 
-## Setup & Installation
+## Installation
 
-### Prerequisites
-- Node.js 18+
-- npm or pnpm
-
-### Steps
+### 1. Clone or download
 
 ```bash
-# 1. Clone / copy the project
-cd escap-mcp-server
-
-# 2. Install dependencies
-npm install
-
-# 3. Build TypeScript
-npm run build
-
-# 4. Test manually
-node dist/index.js
-# Server starts and waits on stdin — Ctrl+C to exit
+git clone <your-repo-url> escap-mcp
+cd escap-mcp
 ```
+
+Or if you downloaded a zip, extract it and `cd` into the folder.
+
+### 2. Install dependencies
+
+```bash
+npm install
+```
+
+### 3. Build
+
+```bash
+npm run build
+```
+
+This compiles TypeScript to `dist/index.js`.
+
+### 4. Verify
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node dist/index.js
+```
+
+You should see a JSON response listing all 5 tools.
 
 ---
 
-## Integration with Claude Desktop
+## Configuration in Claude Desktop
 
-Add this block to your Claude Desktop config file.
+Open your Claude Desktop config file:
 
-**Config file location:**
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+Add the server under `mcpServers`:
 
 ```json
 {
   "mcpServers": {
-    "escap-sdg": {
+    "escap-data-explorer": {
       "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/escap-mcp-server/dist/index.js"]
+      "args": ["/absolute/path/to/escap-mcp/dist/index.js"]
     }
   }
 }
 ```
+
+Replace `/absolute/path/to/escap-mcp` with the actual path where you cloned/extracted the project.
 
 Restart Claude Desktop. You should see the ESCAP tools available.
 
 ---
 
-## Integration with Claude Code
+## Configuration in other MCP clients
 
-Run inline:
-
-```bash
-claude mcp add escap-sdg node /absolute/path/to/dist/index.js
-```
-
-Or add to `.claude/settings.json` in your project:
+For any MCP-compatible client, use:
 
 ```json
 {
-  "mcpServers": {
-    "escap-sdg": {
-      "command": "node",
-      "args": ["/absolute/path/to/escap-mcp-server/dist/index.js"]
-    }
-  }
+  "command": "node",
+  "args": ["dist/index.js"],
+  "cwd": "/path/to/escap-mcp"
 }
 ```
 
 ---
 
-## Example Prompts (after connection)
+## Recommended Agent Workflow
 
-Once connected to an MCP host, try:
+Agents should follow these steps in order:
 
+### Step 1 — Browse indicators
 ```
-Fetch SDG indicator G14_0b_01 data from 2015 to 2025
+Use tool: get_indicators
 ```
+Returns the full SDG + Thematic indicator hierarchy. Browse to find a relevant indicator. The **indicator code** is the last segment after `#` in the `val` field. **Only use codes returned by this tool.**
 
+### Step 2 — Inspect indicator metadata
 ```
-List all available dataflows from ESCAP
+Use tool: get_indicator_metadata
+  indicatorCode: "SI_POV_DAY1"   ← example
+  datasetType: "SDG"             ← "SDG" or "Thematic"
 ```
+Returns dimensions, attributes, and structural metadata for the indicator.
 
+### Step 3 — Get country codes
 ```
-Show me the structure and dimensions of the SDG_Dataflow dataflow
+Use tool: get_countries
 ```
+Returns a table of all countries with their `id` codes (e.g. `CHN`, `IND`, `THA`) and full names.
 
+### Step 4 — Check data availability
 ```
-Build the API URL for indicator G14_0b_01, annual frequency, 2018–2023
+Use tool: check_data_availability
+  indicatorCode: "SI_POV_DAY1"
+  datasetType: "SDG"
+  countryId: "THA"    ← optional; omit for all countries
+  startYear: 2010
+  endYear: 2022
+```
+Returns whether data is available for the requested country/period, plus a list of all countries that have data.
+
+### Step 5 — Fetch data
+```
+Use tool: get_data
+  indicatorCode: "SI_POV_DAY1"
+  datasetType: "SDG"
+  countryId: "THA"    ← optional
+  startYear: 2010
+  endYear: 2022
+```
+Returns data in SDMX CSV format with all dimensions and observation values.
+
+---
+
+## API Endpoints Used
+
+| Purpose | Endpoint |
+|---------|----------|
+| Indicator search | `https://dataexplorer.unescap.org/search/api/search?tenant=demo` |
+| Indicator metadata | `https://api-dataexplorer.unescap.org/rest/v2/data/dataflow/ESCAP/{type}_Dataflow/2.10/` |
+| Country codelist | `https://api-dataexplorer.unescap.org/rest/codelist/escap/cl_ref_area` |
+| Data availability | `https://api-dataexplorer.unescap.org/rest/availableconstraint/ESCAP,{type}_Dataflow,2.10/` |
+| Data retrieval | `https://api-dataexplorer.unescap.org/rest/data/ESCAP,{type}_Dataflow,2.10/` |
+
+Base REST API: `http://api-dataexplorer.unescap.org/rest/` (SDMX v2.1, European Commission standard)
+
+---
+
+## Error Handling
+
+All errors include:
+- **HTTP status code** (e.g. `HTTP 404 Not Found`)
+- **Full API error response body** for debugging
+- **Parameter validation errors** with field-level messages
+
+Example error message:
+```
+HTTP 404 Not Found from https://api-dataexplorer.unescap.org/rest/...
+Response body: <?xml version="1.0"?>
+<Error ... >No data found for the requested filter</Error>
 ```
 
 ---
 
-## API URL Patterns
+## Development
 
-### Data endpoint
-```
-GET /rest/data/{agency},{dataflowId},{version}/{key}
-    ?startPeriod=YYYY
-    &endPeriod=YYYY
-    &dimensionAtObservation=AllDimensions
-```
+```bash
+# Type-check without building
+npx tsc --noEmit
 
-### Dataflow/structure endpoint
-```
-GET /rest/dataflow/{agency}/{dataflowId}/{version}
-    ?references=all
+# Watch mode (requires ts-node)
+npm run dev
+
+# Build for production
+npm run build
 ```
 
-### Key format (SDMX dimension filter)
+### Project structure
+
 ```
-.G14_0b_01..A
- ^           ^--- Frequency (A=Annual)
- |--- Leading dot = "all" for first dimension
-             ^--- Two dots = "all" for middle dimensions
+escap-mcp/
+├── src/
+│   └── index.ts        ← All server logic (single file)
+├── dist/               ← Compiled output (after npm run build)
+│   └── index.js
+├── package.json
+├── tsconfig.json
+└── README.md
 ```
 
 ---
 
-## Extending the MVP
+## License
 
-Ideas for next steps:
-
-1. **Caching** — Add in-memory or Redis cache for dataflow metadata (rarely changes)
-2. **Response slimming** — Parse SDMX-JSON into a clean table before returning to the LLM
-3. **Country filtering** — Add a dedicated `get_data_by_country` tool with ISO 3166 code lookup
-4. **Pagination** — Handle large responses by streaming or chunking
-5. **Auth** — Add API key header support if the endpoint requires authentication
-6. **MCP Resources** — Expose codelists as MCP Resources so the LLM can browse them
-7. **MCP Prompts** — Register prompt templates like "compare_countries" or "trend_analysis"
-
----
-
-## Troubleshooting
-
-| Problem | Fix |
-|---|---|
-| `Cannot find module` | Run `npm run build` first |
-| `API error 404` | Check agency/dataflowId/version in your query |
-| XML response instead of JSON | Normal — api-client.ts auto-parses XML via xml2js |
-| Server not appearing in Claude | Check absolute path in config; restart Claude |
+MIT
