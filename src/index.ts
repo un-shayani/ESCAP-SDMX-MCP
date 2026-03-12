@@ -548,12 +548,17 @@ async function startStdio(): Promise<void> {
 }
 
 async function startHttp(): Promise<void> {
-  // PATH_PREFIX: if your reverse proxy forwards the full path to this server,
-  // set PATH_PREFIX to the prefix so routing matches correctly.
-  // e.g. Nginx proxies https://example.com/mcp/ → http://localhost:9000/mcp/
-  //      → set PATH_PREFIX=/mcp
-  // If Nginx strips the prefix before forwarding, leave PATH_PREFIX unset.
-  const pathPrefix = (process.env.PATH_PREFIX ?? "").replace(/\/$/, "");
+  // Apache strips the /mcp prefix before forwarding to this container
+  // (ProxyPass /mcp/ http://localhost:9000/ — trailing slash = prefix stripped).
+  // So PATH_PREFIX should be "" here. Only set it if your proxy passes the
+  // prefix through unchanged.
+  //
+  // CLIENT_MESSAGE_PATH: the path the *client* sees for POSTing messages.
+  // Because Apache strips /mcp on the way in but the client is at /mcp/message,
+  // we need to tell SSEServerTransport the client-visible path explicitly.
+  // Set CLIENT_MESSAGE_PATH=/mcp/message in docker-compose.yml.
+  const pathPrefix           = (process.env.PATH_PREFIX ?? "").replace(/\/$/, "");
+  const clientMessagePath    = process.env.CLIENT_MESSAGE_PATH ?? `${pathPrefix}/message`;
 
   const ssePath     = `${pathPrefix}/sse`;
   const messagePath = `${pathPrefix}/message`;
@@ -562,14 +567,12 @@ async function startHttp(): Promise<void> {
   // Track live sessions: sessionId → transport
   const transports = new Map<string, SSEServerTransport>();
 
-  // Extract just the pathname from a raw req.url (strips query string)
   function pathname(url: string | undefined): string {
     if (!url) return "/";
     const q = url.indexOf("?");
     return q === -1 ? url : url.slice(0, q);
   }
 
-  // mcp-remote appends ?sessionId=<id> to the POST URL rather than using a header
   function sessionIdFromUrl(url: string | undefined): string | undefined {
     if (!url) return undefined;
     const q = url.indexOf("?");
@@ -580,48 +583,85 @@ async function startHttp(): Promise<void> {
   const httpServer = http.createServer(async (req, res) => {
     const path = pathname(req.url);
 
-    // ── Health check ─────────────────────────────────────────────────────────
+    // Log every request to help diagnose proxy routing issues
+    console.error(`[HTTP] ${req.method} ${req.url}`);
+
+    // ── Health check ──────────────────────────────────────────────────────────
     if (req.method === "GET" && path === healthPath) {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", transport: "http+sse", pathPrefix: pathPrefix || "/" }));
+      res.end(JSON.stringify({
+        status: "ok",
+        transport: "http+sse",
+        ssePath,
+        messagePath,
+        clientMessagePath,
+      }));
       return;
     }
 
-    // ── SSE endpoint — client opens a persistent EventSource here ────────────
+    // ── SSE endpoint ──────────────────────────────────────────────────────────
     if (req.method === "GET" && path === ssePath) {
       const server = createServer();
 
-      // The string passed to SSEServerTransport is the URL the client will POST
-      // messages to. It must match the client-visible path (through the proxy).
-      const transport = new SSEServerTransport(messagePath, res);
+      // Write SSE headers explicitly before SSEServerTransport takes over.
+      // "no-transform" stops Apache/proxies from re-encoding the body.
+      // Flushing the headers first ensures the proxy doesn't buffer waiting
+      // for a complete response.
+      res.writeHead(200, {
+        "Content-Type":     "text/event-stream",
+        "Cache-Control":    "no-cache, no-transform",
+        "Connection":       "keep-alive",
+        "X-Accel-Buffering":"no",
+        "Transfer-Encoding":"chunked",
+      });
+
+      // Immediately write a comment line so Apache flushes the response headers
+      // to the client right away. Without this, Apache may buffer until it has
+      // enough data, and the client never receives the endpoint event.
+      res.write(": connected\n\n");
+
+      // SSEServerTransport's first argument is the URL the client should POST
+      // messages to. This must be the *client-visible* URL — i.e. the path the
+      // browser/mcp-remote sees BEFORE Apache strips the prefix.
+      // Apache strips /mcp inbound, so the server receives /message, but the
+      // client must POST to /mcp/message. We pass clientMessagePath for this.
+      const transport = new SSEServerTransport(clientMessagePath, res);
       transports.set(transport.sessionId, transport);
 
+      // Heartbeat: send SSE comment every 15 s to prevent Apache from closing
+      // idle connections and to force-flush any intermediate buffers.
+      const heartbeat = setInterval(() => {
+        if (!res.writableEnded) {
+          res.write(": ping\n\n");
+        }
+      }, 15000);
+
       res.on("close", () => {
+        clearInterval(heartbeat);
         transports.delete(transport.sessionId);
-        console.error(`[SSE] Client disconnected — session ${transport.sessionId}`);
+        console.error(`[SSE] Disconnected — session ${transport.sessionId}`);
       });
 
       await server.connect(transport);
-      console.error(`[SSE] Client connected — session ${transport.sessionId}`);
+      console.error(`[SSE] Connected — session ${transport.sessionId} | client posts to: ${clientMessagePath}`);
       return;
     }
 
-    // ── Message endpoint — client POSTs JSON-RPC here ────────────────────────
+    // ── Message endpoint ──────────────────────────────────────────────────────
     if (req.method === "POST" && path === messagePath) {
-      // mcp-remote sends sessionId as a query param (?sessionId=...)
-      // Fall back to x-session-id header for other clients
       const sessionId =
         sessionIdFromUrl(req.url) ??
         (req.headers["x-session-id"] as string | undefined);
 
       if (!sessionId) {
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Missing sessionId (expected as ?sessionId= query param or x-session-id header)" }));
+        res.end(JSON.stringify({ error: "Missing sessionId (?sessionId= param or x-session-id header)" }));
         return;
       }
 
       const transport = transports.get(sessionId);
       if (!transport) {
+        console.error(`[HTTP] Unknown session: ${sessionId} | known: ${[...transports.keys()].join(", ") || "none"}`);
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: `Unknown session: ${sessionId}` }));
         return;
@@ -631,23 +671,23 @@ async function startHttp(): Promise<void> {
       return;
     }
 
-    // ── 404 — log it to help diagnose routing issues ──────────────────────────
-    console.error(`[HTTP] 404 ${req.method} ${req.url}`);
+    // ── 404 ───────────────────────────────────────────────────────────────────
     res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not found", receivedPath: path, expectedPaths: [ssePath, messagePath, healthPath] }));
+    res.end(JSON.stringify({
+      error: "Not found",
+      receivedPath: path,
+      expectedPaths: [ssePath, messagePath, healthPath],
+    }));
   });
 
   httpServer.listen(PORT, () => {
     console.error(`ESCAP MCP Server listening on http://0.0.0.0:${PORT}`);
-    console.error(`  SSE endpoint:     http://0.0.0.0:${PORT}${ssePath}`);
-    console.error(`  Message endpoint: http://0.0.0.0:${PORT}${messagePath}`);
-    console.error(`  Health check:     http://0.0.0.0:${PORT}${healthPath}`);
-    if (pathPrefix) {
-      console.error(`  Path prefix:      ${pathPrefix}  (PATH_PREFIX env var)`);
-    }
+    console.error(`  SSE endpoint:        http://0.0.0.0:${PORT}${ssePath}`);
+    console.error(`  Message endpoint:    http://0.0.0.0:${PORT}${messagePath}`);
+    console.error(`  Client message path: ${clientMessagePath}  (what client POSTs to)`);
+    console.error(`  Health check:        http://0.0.0.0:${PORT}${healthPath}`);
   });
 }
-
 async function main(): Promise<void> {
   if (TRANSPORT === "http") {
     await startHttp();
