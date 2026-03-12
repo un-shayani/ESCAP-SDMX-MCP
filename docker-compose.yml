@@ -1,6 +1,6 @@
 services:
   escap-mcp:
-    image: escap-mcp:latest        # built locally — see deployment steps in README
+    image: escap-mcp:latest
     container_name: escap-mcp
     restart: unless-stopped
     ports:
@@ -8,26 +8,27 @@ services:
     environment:
       MCP_TRANSPORT: http
       PORT: 9000
-      # PATH_PREFIX must match the path prefix your reverse proxy passes through.
-      # If Nginx proxies /mcp/ → http://localhost:9000/mcp/ (passes prefix), set:
-      #   PATH_PREFIX: /mcp
-      # If Nginx strips the prefix before forwarding, remove this or leave blank.
-      PATH_PREFIX: /mcp
+
+      # PATH_PREFIX: the path prefix the server receives from Apache.
+      # Your Apache config uses: ProxyPass /mcp/ http://localhost:9000/
+      # The trailing slash means Apache STRIPS /mcp before forwarding.
+      # So the container receives /sse and /message — leave PATH_PREFIX empty.
+      PATH_PREFIX: ""
+
+      # CLIENT_MESSAGE_PATH: the path the *client (mcp-remote)* sees for POSTing.
+      # The client is at https://dataexplorer.unescap.org/mcp/sse, so it will
+      # construct the POST URL relative to that base. The SSE endpoint event
+      # must advertise /mcp/message so the client POSTs to the right Apache path.
+      CLIENT_MESSAGE_PATH: /mcp/message
+
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/health"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
-    # Optional: uncomment to attach to an existing network (e.g. a reverse proxy)
-    # networks:
-    #   - proxy
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-
-# networks:
-#   proxy:
-#     external: true
