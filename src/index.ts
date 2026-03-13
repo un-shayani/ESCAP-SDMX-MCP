@@ -11,7 +11,7 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ErrorCode,
@@ -537,7 +537,8 @@ function createServer(): Server {
 }
 
 // ---------------------------------------------------------------------------
-// Transport — stdio (local dev) or HTTP+SSE (Docker / remote)
+// ---------------------------------------------------------------------------
+// Transport — stdio (local dev) or Streamable HTTP (Docker / remote)
 // ---------------------------------------------------------------------------
 
 async function startStdio(): Promise<void> {
@@ -548,24 +549,18 @@ async function startStdio(): Promise<void> {
 }
 
 async function startHttp(): Promise<void> {
-  // Apache strips the /mcp prefix before forwarding to this container
-  // (ProxyPass /mcp/ http://localhost:9000/ — trailing slash = prefix stripped).
-  // So PATH_PREFIX should be "" here. Only set it if your proxy passes the
-  // prefix through unchanged.
+  // Apache config: ProxyPass /mcp/ http://localhost:9000/
+  // The trailing slash means Apache STRIPS /mcp before forwarding to the container.
+  // So the container receives paths like /message, /health (no /mcp prefix).
   //
-  // CLIENT_MESSAGE_PATH: the path the *client* sees for POSTing messages.
-  // Because Apache strips /mcp on the way in but the client is at /mcp/message,
-  // we need to tell SSEServerTransport the client-visible path explicitly.
-  // Set CLIENT_MESSAGE_PATH=/mcp/message in docker-compose.yml.
-  const pathPrefix           = (process.env.PATH_PREFIX ?? "").replace(/\/$/, "");
-  const clientMessagePath    = process.env.CLIENT_MESSAGE_PATH ?? `${pathPrefix}/message`;
+  // Streamable HTTP uses a single endpoint for everything (POST /message).
+  // Sessions are managed via Mcp-Session-Id headers, not query params.
+  const pathPrefix   = (process.env.PATH_PREFIX ?? "").replace(/\/$/, ""); // "" for current Apache setup
+  const messagePath  = `${pathPrefix}/message`;
+  const healthPath   = `${pathPrefix}/health`;
 
-  const ssePath     = `${pathPrefix}/sse`;
-  const messagePath = `${pathPrefix}/message`;
-  const healthPath  = `${pathPrefix}/health`;
-
-  // Track live sessions: sessionId → transport
-  const transports = new Map<string, SSEServerTransport>();
+  // Map of sessionId → StreamableHTTPServerTransport (one per client session)
+  const transports = new Map<string, StreamableHTTPServerTransport>();
 
   function pathname(url: string | undefined): string {
     if (!url) return "/";
@@ -573,102 +568,94 @@ async function startHttp(): Promise<void> {
     return q === -1 ? url : url.slice(0, q);
   }
 
-  function sessionIdFromUrl(url: string | undefined): string | undefined {
-    if (!url) return undefined;
-    const q = url.indexOf("?");
-    if (q === -1) return undefined;
-    return new URLSearchParams(url.slice(q + 1)).get("sessionId") ?? undefined;
-  }
-
   const httpServer = http.createServer(async (req, res) => {
     const path = pathname(req.url);
 
-    // Log every request to help diagnose proxy routing issues
+    // Log every incoming request to aid debugging
     console.error(`[HTTP] ${req.method} ${req.url}`);
 
     // ── Health check ──────────────────────────────────────────────────────────
     if (req.method === "GET" && path === healthPath) {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        status: "ok",
-        transport: "http+sse",
-        ssePath,
-        messagePath,
-        clientMessagePath,
-      }));
+      res.end(JSON.stringify({ status: "ok", transport: "streamable-http", messagePath }));
       return;
     }
 
-    // ── SSE endpoint ──────────────────────────────────────────────────────────
-    if (req.method === "GET" && path === ssePath) {
-      const server = createServer();
+    // ── Streamable HTTP message endpoint ──────────────────────────────────────
+    // All MCP communication (initialize, tools/list, tools/call, etc.) goes
+    // through POST /message. GET /message opens a server-sent event stream for
+    // server-to-client pushes. DELETE /message terminates a session.
+    if (path === messagePath) {
 
-      // Write SSE headers explicitly before SSEServerTransport takes over.
-      // "no-transform" stops Apache/proxies from re-encoding the body.
-      // Flushing the headers first ensures the proxy doesn't buffer waiting
-      // for a complete response.
-      res.writeHead(200, {
-        "Content-Type":     "text/event-stream",
-        "Cache-Control":    "no-cache, no-transform",
-        "Connection":       "keep-alive",
-        "X-Accel-Buffering":"no",
-        "Transfer-Encoding":"chunked",
-      });
+      // ── POST: client → server (initialize, tool calls, …) ─────────────────
+      if (req.method === "POST") {
+        const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-      // Immediately write a comment line so Apache flushes the response headers
-      // to the client right away. Without this, Apache may buffer until it has
-      // enough data, and the client never receives the endpoint event.
-      res.write(": connected\n\n");
-
-      // SSEServerTransport's first argument is the URL the client should POST
-      // messages to. This must be the *client-visible* URL — i.e. the path the
-      // browser/mcp-remote sees BEFORE Apache strips the prefix.
-      // Apache strips /mcp inbound, so the server receives /message, but the
-      // client must POST to /mcp/message. We pass clientMessagePath for this.
-      const transport = new SSEServerTransport(clientMessagePath, res);
-      transports.set(transport.sessionId, transport);
-
-      // Heartbeat: send SSE comment every 15 s to prevent Apache from closing
-      // idle connections and to force-flush any intermediate buffers.
-      const heartbeat = setInterval(() => {
-        if (!res.writableEnded) {
-          res.write(": ping\n\n");
+        // Existing session: route to the right transport
+        if (sessionId && transports.has(sessionId)) {
+          const transport = transports.get(sessionId)!;
+          await transport.handleRequest(req, res);
+          return;
         }
-      }, 15000);
 
-      res.on("close", () => {
-        clearInterval(heartbeat);
-        transports.delete(transport.sessionId);
-        console.error(`[SSE] Disconnected — session ${transport.sessionId}`);
-      });
+        // No session yet: this must be the initialize request — create a new one
+        if (!sessionId) {
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => crypto.randomUUID(),
+            onsessioninitialized: (id) => {
+              transports.set(id, transport);
+              console.error(`[MCP] Session created: ${id}`);
+            },
+          });
 
-      await server.connect(transport);
-      console.error(`[SSE] Connected — session ${transport.sessionId} | client posts to: ${clientMessagePath}`);
-      return;
-    }
+          transport.onclose = () => {
+            const id = transport.sessionId;
+            if (id) {
+              transports.delete(id);
+              console.error(`[MCP] Session closed: ${id}`);
+            }
+          };
 
-    // ── Message endpoint ──────────────────────────────────────────────────────
-    if (req.method === "POST" && path === messagePath) {
-      const sessionId =
-        sessionIdFromUrl(req.url) ??
-        (req.headers["x-session-id"] as string | undefined);
+          const server = createServer();
+          await server.connect(transport);
+          await transport.handleRequest(req, res);
+          return;
+        }
 
-      if (!sessionId) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Missing sessionId (?sessionId= param or x-session-id header)" }));
-        return;
-      }
-
-      const transport = transports.get(sessionId);
-      if (!transport) {
-        console.error(`[HTTP] Unknown session: ${sessionId} | known: ${[...transports.keys()].join(", ") || "none"}`);
+        // Has a session ID but it's unknown — reject
+        console.error(`[MCP] Unknown session: ${sessionId}`);
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: `Unknown session: ${sessionId}` }));
         return;
       }
 
-      await transport.handlePostMessage(req, res);
-      return;
+      // ── GET: open SSE stream for server-initiated messages ─────────────────
+      if (req.method === "GET") {
+        const sessionId = req.headers["mcp-session-id"] as string | undefined;
+        if (!sessionId || !transports.has(sessionId)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing or unknown Mcp-Session-Id header" }));
+          return;
+        }
+        const transport = transports.get(sessionId)!;
+        await transport.handleRequest(req, res);
+        return;
+      }
+
+      // ── DELETE: client explicitly closes a session ─────────────────────────
+      if (req.method === "DELETE") {
+        const sessionId = req.headers["mcp-session-id"] as string | undefined;
+        if (sessionId && transports.has(sessionId)) {
+          const transport = transports.get(sessionId)!;
+          await transport.handleRequest(req, res);
+          transports.delete(sessionId);
+          console.error(`[MCP] Session deleted: ${sessionId}`);
+        } else {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Session not found" }));
+        }
+        return;
+      }
     }
 
     // ── 404 ───────────────────────────────────────────────────────────────────
@@ -676,18 +663,20 @@ async function startHttp(): Promise<void> {
     res.end(JSON.stringify({
       error: "Not found",
       receivedPath: path,
-      expectedPaths: [ssePath, messagePath, healthPath],
+      expectedPaths: [messagePath, healthPath],
     }));
   });
 
   httpServer.listen(PORT, () => {
-    console.error(`ESCAP MCP Server listening on http://0.0.0.0:${PORT}`);
-    console.error(`  SSE endpoint:        http://0.0.0.0:${PORT}${ssePath}`);
-    console.error(`  Message endpoint:    http://0.0.0.0:${PORT}${messagePath}`);
-    console.error(`  Client message path: ${clientMessagePath}  (what client POSTs to)`);
-    console.error(`  Health check:        http://0.0.0.0:${PORT}${healthPath}`);
+    console.error(`ESCAP MCP Server (Streamable HTTP) listening on http://0.0.0.0:${PORT}`);
+    console.error(`  Message endpoint: http://0.0.0.0:${PORT}${messagePath}`);
+    console.error(`  Health check:     http://0.0.0.0:${PORT}${healthPath}`);
+    if (pathPrefix) {
+      console.error(`  Path prefix:      ${pathPrefix}  (PATH_PREFIX env var)`);
+    }
   });
 }
+
 async function main(): Promise<void> {
   if (TRANSPORT === "http") {
     await startHttp();

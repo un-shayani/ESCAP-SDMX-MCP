@@ -8,19 +8,10 @@ services:
     environment:
       MCP_TRANSPORT: http
       PORT: 9000
-
-      # PATH_PREFIX: the path prefix the server receives from Apache.
-      # Your Apache config uses: ProxyPass /mcp/ http://localhost:9000/
-      # The trailing slash means Apache STRIPS /mcp before forwarding.
-      # So the container receives /sse and /message — leave PATH_PREFIX empty.
+      # Apache uses: ProxyPass /mcp/ http://localhost:9000/
+      # Trailing slash = Apache strips /mcp before forwarding.
+      # Container receives /message and /health — leave PATH_PREFIX empty.
       PATH_PREFIX: ""
-
-      # CLIENT_MESSAGE_PATH: the path the *client (mcp-remote)* sees for POSTing.
-      # The client is at https://dataexplorer.unescap.org/mcp/sse, so it will
-      # construct the POST URL relative to that base. The SSE endpoint event
-      # must advertise /mcp/message so the client POSTs to the right Apache path.
-      CLIENT_MESSAGE_PATH: /mcp/message
-
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/health"]
       interval: 30s
