@@ -215,7 +215,7 @@ async function getIndicatorMetadata(
     `${REST_API_BASE}/v2/data/dataflow/ESCAP/${dsType}_Dataflow/2.10/` +
     `*.${indicatorCode}.A?attributes=msd&measures=none&dimensionAtObservation=AllDimensions`;
 
-  const raw = await fetchText(url, "application/vnd.sdmx.data+json");
+  const raw = await fetchText(url, "application/xml");
 
   try {
     const parsed = JSON.parse(raw);
