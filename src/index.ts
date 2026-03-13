@@ -214,25 +214,15 @@ async function getIndicatorMetadata(
   const url =
     `${REST_API_BASE}/v2/data/dataflow/ESCAP/${dsType}_Dataflow/2.10/` +
     `*.${indicatorCode}.A?attributes=msd&measures=none&dimensionAtObservation=AllDimensions`;
-
+ 
   const raw = await fetchText(url, "application/xml");
-
-  try {
-    const parsed = JSON.parse(raw);
-    return (
-      `Metadata for indicator: ${indicatorCode} (${dsType} dataset)\n` +
-      "=".repeat(50) +
-      "\n" +
-      JSON.stringify(parsed, null, 2)
-    );
-  } catch {
-    return (
-      `Metadata for indicator: ${indicatorCode} (${dsType} dataset)\n` +
-      "=".repeat(50) +
-      "\n" +
-      raw
-    );
-  }
+ 
+  return (
+    `Metadata for indicator: ${indicatorCode} (${dsType} dataset)\n` +
+    "=".repeat(50) +
+    "\n" +
+    raw
+  );
 }
 
 async function getCountries(): Promise<string> {
